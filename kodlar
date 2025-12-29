@@ -1,0 +1,201 @@
+pip install gymnasium stable-baselines3 shimmy matplotlib numpy 
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
+import pygame
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+
+# ---------------------------------------------------------
+# 1. EŞSİZ ÇEVRE TASARIMI: EcoFlight-Master-v4
+# ---------------------------------------------------------
+
+class EcoFlightMasterEnv(gym.Env):
+    def __init__(self):
+        super(EcoFlightMasterEnv, self).__init__()
+        
+        # Hedefler ve Sınırlar
+        self.TARGET_ALTITUDE = 10000.0
+        self.TARGET_SPEED = 500.0
+        self.MAX_ALTITUDE = 20000.0
+        self.MAX_SPEED = 850.0
+        self.MIN_SPEED = 180.0
+        self.MAX_FUEL = 3000.0
+
+        # Aksiyonlar: [Gaz Değişimi, Pitch Açısı]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+        # Gözlemler: [İrtifa, Hız, Radar, Yakıt, Dikey Hız]
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(5,), dtype=np.float32) #burada low=-np.inf ve high=np.inf o ile bir yaptık çünkü gözlemleri biz 0-1 arası normalize veriyorum bu da ppo da dengesizlik oluşturuyor. 
+
+        self.screen = None
+        self.clock = None
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.altitude = 8000.0 + np.random.uniform(-500, 500)
+        self.speed = 400.0
+        self.fuel = self.MAX_FUEL
+        self.radar_dist = 5000.0
+        self.v_speed = 0.0
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        return np.array([
+            self.altitude / self.MAX_ALTITUDE,
+            self.speed / self.MAX_SPEED,
+            self.radar_dist / 5000.0,
+            self.fuel / self.MAX_FUEL,
+            self.v_speed / 100.0
+        ], dtype=np.float32)
+
+    def step(self, action):
+        throttle, pitch = np.clip(action[0], -1, 1), np.clip(action[1], -1, 1)
+        
+        # --- GELİŞMİŞ FİZİK MOTORU ---
+        # Yakıt Tüketimi: Gaz ve Hızın karesiyle orantılı (Hava direnci etkisi)
+        fuel_consumption = (abs(throttle) * 0.2 + 0.1) * (1 + (self.speed / self.MAX_SPEED)**2) # burada 0.4 katsayıyı 0.2 düşürdüm sebebi yakıt tüketimi güce ve hıza bağlı olarak  daha yavaş gerçekleşir.bu da modelin uçuş sırasında  daha uzun süre istikralı olmasını sağlar.Böylece ani dalgalanmalar azalır model daha iyi öğrenme süreci geçirir. 
+        self.fuel -= fuel_consumption
+        
+        # İrtifa ve Hız Değişimi
+        drag = 0.02 * (self.speed / 100.0)**2
+        gravity_loss = pitch * 2.5 # Tırmanış hızı düşürür 2.5 # Tırmanış hızı düşürür Burada 3.5 yerine 2.5 a düşürdüm. bu ve altındaki satırdaki katsayı düşüşleri modelin daha dengeli öğrenmesini sağlar. 
+        self.speed += (throttle * 10.0) - drag - gravity_loss # burada 10 katsayısını 12 den düşürdüm daha yumuşak hız artışı için, 8 de düşürülebilir.
+        self.speed = np.clip(self.speed, self.MIN_SPEED, self.MAX_SPEED)  #self.MIN_SPEED kısmı 0 idi onu self.MIN_SPEED yaptık çünkü 0 da agentın hızının 0 düşmesi gibi saçma statelere düşmesine sebep oluyor.
+        
+        self.v_speed = (pitch * 50.0) * (self.speed / 400.0)
+        self.altitude += self.v_speed
+        
+        self.radar_dist -= (self.speed * 0.2)
+        if self.radar_dist <= -200: self.radar_dist = 5000.0
+
+        # --- GELİŞMİŞ ÖDÜL FONKSİYONU (Reward Shaping) ---
+        reward = 0.0
+        
+        # A. İrtifa ve Hız Hassasiyeti (Exponential Reward)
+        alt_reward = np.exp(-(abs(self.altitude - self.TARGET_ALTITUDE) / 1500.0)) * 8.0 # irtifa  ödüllerini çok sivriydi yumuşattık 1000.0*10.0 iken 1500.0*8.0 yaptık geniş töleranslı yaparak dalgalnmayı azaltmaya çalıştık
+        spd_reward = np.exp(-(abs(self.speed - self.TARGET_SPEED) / 200.0)) * 4.0 # hız için ise 150.0*5.0  200.0*4.0 ile değiştirdik.
+        reward += alt_reward + spd_reward
+
+        # B. Yakıt Verimliliği Ödülü
+        # Az yakıt harcandığında ödül katlanarak artar
+        reward += (1.0 / (fuel_consumption + 1.0)) * 1.0 # bölmedeki 2 değerini 1 çarpmadaki 3 değerini yine bir yaptık fuel consumption zaten küçük bu da sürekli büyük ve baskın ödül basa biliyor.
+
+        # C. Stabilite Ödülü (Sarsıntısız uçuş için aksiyon cezası)
+        reward -= (abs(pitch) * 0.2 + abs(throttle) * 0.1)
+
+        # D. Güvenlik ve Kaza Cezaları
+        terminated = False
+        if self.altitude < 400 or self.altitude > self.MAX_ALTITUDE:
+            reward -= 500.0; terminated = True # buradaki cezayı 1000 den 500 çektik.Biraz hafiflettik modelin daha dengeli öğrenmesini sağladık.
+        if self.speed < self.MIN_SPEED:
+            reward -= 500.0; terminated = True
+        if self.fuel <= 0:
+            reward -= 500.0; terminated = True
+        if 0 < self.radar_dist < 300 and self.altitude < 12000: # Engel altındaysa çarpışır
+            reward -= 1000.0; terminated = True # Radarda burada 1500 olan cezayı 1000 çektik.Buradaki çevre engelini yumuşatarak modelin çevre uyumunu kolaylaştırdık.
+
+        return self._get_obs(), reward, terminated, False, {"alt": self.altitude, "spd": self.speed, "fuel": self.fuel}
+
+    def render(self):
+        if self.screen is None:
+            pygame.init()
+            self.screen = pygame.display.set_mode((800, 500))
+            self.clock = pygame.time.Clock()
+        
+        self.screen.fill((30, 144, 255)) # Gökyüzü Mavisi
+        pygame.draw.rect(self.screen, (34, 139, 34), (0, 480, 800, 20)) # Yer
+        
+        target_y = 480 - int(self.TARGET_ALTITUDE / 40)
+        alt_y = 480 - int(self.altitude / 40)
+        
+        pygame.draw.line(self.screen, (255, 215, 0), (0, target_y), (800, target_y), 1) # Hedef
+        pygame.draw.rect(self.screen, (255, 255, 255), (150, alt_y, 45, 15), border_radius=4) # Uçak
+        
+        if self.radar_dist < 5000:
+            mx = int(self.radar_dist / 6.5) + 150
+            pygame.draw.polygon(self.screen, (105, 105, 105), [(mx, 480), (mx+160, 480), (mx+80, 150)])
+
+        pygame.display.flip()
+        self.clock.tick(10) # 60 dı parentez içini 10 yaptım sümilasyon daha yavaş aksın diye
+
+# ---------------------------------------------------------
+# 2. ANALİZ VE GRAFİK CALLBACK
+# ---------------------------------------------------------
+
+class FlightAnalyticCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(FlightAnalyticCallback, self).__init__(verbose)
+        self.episode_rewards = []
+        self.curr_reward = 0
+
+    def _on_step(self) -> bool:
+        self.curr_reward += self.locals['rewards'][0]
+        if self.locals['dones'][0]:
+            self.episode_rewards.append(self.curr_reward)
+            self.curr_reward = 0
+        return True
+
+# ---------------------------------------------------------
+# 3. ANA ÇALIŞTIRMA (TRAIN & TEST)
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+    env = Monitor(EcoFlightMasterEnv())
+    
+    # PPO: En stabil ve az dalgalanan algoritma
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0002, n_steps=2048) # Öğrenme algoritmasındaki 0.0003 değerini 0.0002 çektim.Sebebi öğrenme hızını stabilize ettim.Bununla öğrenme hızını optimize etmeye çalıştım. batch_size=256,ent_coef=0.0,gamma=0.99 2048 den sonra eklene bilir dalgalanmayı azaltmak için
+    
+    print(">>> AJAN EĞİTİLİYOR (Smooth Reward Optimization)...")
+    callback = FlightAnalyticCallback()
+    model.learn(total_timesteps=100000 , callback=callback)  # Burada total zaman adımını 80000 den 100000 e çıkardım sebep dahauzun kapsamlı eğitim sağlamak.
+    
+    # --- GRAFİK 1: ÖĞRENME EĞRİSİ ---
+    plt.figure(figsize=(10, 5))
+    plt.plot(callback.episode_rewards, color='tab:blue', alpha=0.3)
+    # Hareketli ortalama alarak dalgalanmayı temizleyelim
+    smooth_rewards = np.convolve(callback.episode_rewards, np.ones(20)/20, mode='valid') # hareketli ortalama pencereyi 10/10 dan 20/20 getirdik ödül değerindeki dalgalnmaları azaltmak için 
+    plt.plot(smooth_rewards, color='tab:red', label="Hareketli Ortalama (Smooth)")
+    plt.title("Öğrenme Grafiği: Toplam Ödül / Bölüm")
+    plt.legend(); plt.grid(True); plt.show()
+
+    # --- TEST VE SİMÜLASYON ---
+    test_env = EcoFlightMasterEnv()
+    obs, _ = test_env.reset()
+    logs = {"alt": [], "spd": [], "fuel": [], "radar": [], "time": []}
+    
+    print(">>> TEST UÇUŞU BAŞLADI (1500 Adım)...")
+    for t in range(1500): # similasyonu yavaşlatmak için adım sayısı artırılabilir.mesela 5000 yapılabiri tabi render içindeki cliki 60 tekrar getirebiliriz.
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, _, info = test_env.step(action)
+        
+        logs["alt"].append(info["alt"])
+        logs["spd"].append(info["spd"])
+        logs["fuel"].append(info["fuel"])
+        logs["radar"].append(obs[2] * 5000)
+        logs["time"].append(t)
+        
+        test_env.render()
+        if done: break  # simülasyonu çarpsada dağa devam edip görmek için önüne # işareti koyup devre dışı bırakabiliriz.Çünkü böyle olduğunda agentın küçük hatasında direkt simülasyon bitiyor.
+
+    # --- GRAFİK 2: TEKNİK ANALİZ PANELİ ---
+    fig, axs = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    
+    axs[0].plot(logs["time"], logs["alt"], color='blue', label="İrtifa")
+    axs[0].axhline(10000, color='red', linestyle='--')
+    axs[0].set_ylabel("İrtifa (ft)"); axs[0].legend()
+
+    axs[1].plot(logs["time"], logs["spd"], color='green', label="Hız")
+    axs[1].axhline(500, color='red', linestyle='--')
+    axs[1].set_ylabel("Hız (kts)"); axs[1].legend()
+
+    axs[2].plot(logs["time"], logs["fuel"], color='orange', label="Yakıt")
+    axs[2].set_ylabel("Yakıt (L)"); axs[2].legend()
+
+    axs[3].plot(logs["time"], logs["radar"], color='gray', label="Radar (Engel Mesafesi)")
+    axs[3].set_ylabel("Mesafe (m)"); axs[3].legend()
+
+    plt.suptitle("Uçak Cruise Control - Kapsamlı Test Analizi", fontsize=16)
+    plt.tight_layout(); plt.show()
+    pygame.quit()
