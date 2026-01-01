@@ -1,0 +1,151 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from IPython.display import HTML, display
+from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.results_plotter import load_results
+import os
+import shutil
+
+# ---------------------------------------------------------
+# 1. ÖZEL ÇEVRE TASARIMI (ENVIRONMENT)
+# ---------------------------------------------------------
+class AircraftCruiseEnv(gym.Env):
+    def __init__(self):
+        super(AircraftCruiseEnv, self).__init__()
+        # Aksiyon: Kanatçık açısı [-1.0, 1.0]
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        # Gözlem: [Açı (rad), Açısal Hız (rad/s), Dış Etmen Şiddeti]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
+        self.max_steps = 300
+        self.reset()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.theta = np.random.uniform(-0.15, 0.15) 
+        self.theta_dot = 0.0
+        self.steps = 0
+        return np.array([self.theta, self.theta_dot, 0.0], dtype=np.float32), {}
+
+    def step(self, action):
+        # DIŞ ETMENLER: Türbülans, Sabit sapma ve Ani rüzgar
+        # 1. Türbülans (Sürekli gürültü oluşması)
+        turbulence = np.random.normal(0, 0.02)
+        # 2. Ağırlık Merkezi Kayması (Sürekli bir aşağı çekme kuvveti)
+        bias = -0.015 
+        # 3. Rüzgar Hamlesi (Her 120 adımda bir ani etki)
+        gust = 0.25 if (120 < self.steps < 150) else 0.0 
+        
+        total_disturbance = turbulence + bias + gust
+        
+        # FİZİK MOTORU (Pitch Dynamics)
+        dt = 0.1
+        acceleration = (action[0] * 0.8) + total_disturbance
+        self.theta_dot += acceleration * dt
+        self.theta += self.theta_dot * dt
+        
+        # ÖDÜL FONKSİYONU (Senin düzenlediğin yumuşak manevra yapısı(Açı hatası, sarsıntı ve enerji tüketimi cezası))
+        reward = -(25.0 * (self.theta**2) + 1.5 * (self.theta_dot**2) + 0.05 * (action[0]**2)) # burada 30 açı çarpanını 25 ile 2 olan açısal hız çarpanını 1.5 ile  1 olan action manevra çarpanını 0.05 ile değiştik.amaç ajanın daha yumuşak manevra yapmasını sağlamak açı ve açısal hız çarpanını azaltarak.
+        
+        self.steps += 1
+        terminated = self.steps >= self.max_steps
+        truncated = abs(self.theta) > 1.5 
+        
+        obs = np.array([self.theta, self.theta_dot, total_disturbance], dtype=np.float32)
+        return obs, reward, terminated, truncated, {}
+
+# ---------------------------------------------------------
+# 2. EĞİTİM HAZIRLIĞI VE MODEL EĞİTİMİ
+# ---------------------------------------------------------
+log_dir = "./rl_logs/"
+if os.path.exists(log_dir):
+    shutil.rmtree(log_dir)
+os.makedirs(log_dir)
+
+print("--- ADIM 1: Model Eğitiliyor (PPO) ---")
+print("Hedef: 100.000 adım. Lütfen bekleyin...")
+
+env = AircraftCruiseEnv()
+env = Monitor(env, log_dir)
+# Senin belirttiğin hiperparametreler: LR=0.0005, n_steps=2048
+model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0005, n_steps=2048) # burada learning rate değerini 0.007 den 0.005 e steps değerini 1024 den 2048 çıkardık.Amaç Öğrenme oranını bir miktar düşürmek ve adım sayısını artırmak, modelin daha küçük adımlarla daha detaylı öğrenmesini sağlamak 
+model.learn(total_timesteps=100000) # Daha iyi sonuç için 50k den 100000 çıkardık ajanın daha iyi pratik yapması için bu daha kararlı sonuçlar elde etmemize yardımcı olur.
+print("Eğitim tamamlandı.")
+
+# ---------------------------------------------------------
+# 3. TEST VE ANALİZ GRAFİKLERİ
+# ---------------------------------------------------------
+print("--- ADIM 2: Analiz Grafikleri Oluşturuluyor ---")
+test_env = AircraftCruiseEnv()
+obs, _ = test_env.reset()
+
+test_history = {"theta": [], "action": [], "dist": []}
+
+for _ in range(300):
+    action, _ = model.predict(obs, deterministic=True)
+    obs, reward, term, trunc, _ = test_env.step(action)
+    test_history["theta"].append(np.degrees(obs[0]))
+    test_history["action"].append(action[0])
+    test_history["dist"].append(obs[2])
+    if term or trunc: break
+
+# Grafiklerin Çizimi
+results = load_results(log_dir)
+y_rewards = results.r.values
+x_rewards = np.arange(len(y_rewards))
+
+fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+
+# 1. Toplam Ödül Grafiği
+axs[0, 0].plot(x_rewards, y_rewards, alpha=0.2, color='blue')
+if len(y_rewards) > 20:
+    axs[0, 0].plot(np.convolve(y_rewards, np.ones(20)/20, mode='valid'), color='blue', lw=2) #lw(linewidth) demek
+axs[0, 0].set_title("Eğitim: Bölüm Başına Toplam Ödül")
+
+# 2. Test: Açı Değişimi
+axs[0, 1].plot(test_history["theta"], color='red', lw=2)
+axs[0, 1].axhline(0, color='black', ls='--')
+axs[0, 1].set_title("Test: Uçağın Pitch Açısı (Derece)")
+
+# 3. Dış Etkenler
+axs[1, 0].fill_between(range(len(test_history["dist"])), test_history["dist"], color='gray', alpha=0.5)
+axs[1, 0].set_title("Dış Etmenlerin Şiddeti (Türbülans & Rüzgar)")
+
+# 4. Kontrol Hamleleri
+axs[1, 1].step(range(len(test_history["action"])), test_history["action"], color='green')
+axs[1, 1].set_title("Ajanın Kanatçık Müdahaleleri")
+
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------
+# 4. CANLI SİMÜLASYON ANİMASYONU
+# ---------------------------------------------------------
+print("--- ADIM 3: Uçak Denge Simülasyonu Hazırlanıyor ---")
+
+fig_anim, ax_sim = plt.subplots(figsize=(8, 5))
+ax_sim.set_xlim(-1, 1); ax_sim.set_ylim(-1, 1)
+line, = ax_sim.plot([-0.5, 0.5], [0, 0], 'b-', lw=12, solid_capstyle='round')
+text_label = ax_sim.text(-0.9, 0.8, '', fontsize=12, color='red', fontweight='bold')
+ax_sim.axhline(0, color='black', alpha=0.1)
+ax_sim.set_title("Uçak Cruise Stabilizasyonu (PPO Kontrol)")
+
+def update_anim(i):
+    if i >= len(test_history["theta"]): return line, text_label
+    angle = np.radians(test_history["theta"][i])
+    x = [-0.4 * np.cos(angle), 0.4 * np.cos(angle)]
+    y = [-0.4 * np.sin(angle), 0.4 * np.sin(angle)]
+    line.set_data(x, y)
+    
+    if abs(test_history["dist"][i]) > 0.1:
+        text_label.set_text("DIŞ ETKEN: ŞİDDETLİ RÜZGAR!")
+    else:
+        text_label.set_text("")
+    return line, text_label
+
+ani = animation.FuncAnimation(fig_anim, update_anim, frames=len(test_history["theta"]), interval=50, blit=True)
+plt.close()
+display(HTML(ani.to_jshtml()))
