@@ -73,7 +73,7 @@ print("Hedef: 200.000 adım. Lütfen bekleyin...")
 
 env = AircraftCruiseEnv()
 env = Monitor(env, log_dir)
-# Senin belirttiğin hiperparametreler: LR=0.0005, n_steps=2048
+# Benim belirttiğim hiperparametreler: LR=0.0005, n_steps=2048
 model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003, n_steps=4096) # burada learning rate değerini 0.007 den 0.0003 e steps değerini 1024 den 2048 çıkardık.Amaç Öğrenme oranını bir miktar düşürmek ve adım sayısını artırmak, modelin daha küçük adımlarla daha detaylı öğrenmesini sağlamak 
 model.learn(total_timesteps=200000) # Daha iyi sonuç için 100k den 200000 çıkardık ajanın daha iyi pratik yapması için bu daha kararlı sonuçlar elde etmemize yardımcı olur.
 print("Eğitim tamamlandı.")
