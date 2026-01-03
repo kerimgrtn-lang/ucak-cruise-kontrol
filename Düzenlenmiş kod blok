@@ -17,15 +17,15 @@ class AircraftCruiseEnv(gym.Env):
     def __init__(self):
         super(AircraftCruiseEnv, self).__init__()
         # Aksiyon: Kanatçık açısı [-1.0, 1.0]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32) #Ajanın uçağın kanatçıklarını ne kadar hareket ettirebileceğini belirler. -1 (tam aşağı) ve +1 (tam yukarı) arası sürekli bir değerdir.
         # Gözlem: [Açı (rad), Açısal Hız (rad/s), Dış Etmen Şiddeti]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32) #Uçağın o anki durumudur. Ajan; açısını, açısal hızını ve o anki rüzgar şiddetini "görerek" karar verir.
         self.max_steps = 300
         self.reset()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.theta = np.random.uniform(-0.15, 0.15) 
+        self.theta = np.random.uniform(-0.15, 0.15) # Başlangıç sapması
         self.theta_dot = 0.0
         self.steps = 0
         return np.array([self.theta, self.theta_dot, 0.0], dtype=np.float32), {}
@@ -44,13 +44,15 @@ class AircraftCruiseEnv(gym.Env):
         # FİZİK MOTORU (Pitch Dynamics)
         dt = 0.1
         # İvme = (Ajanın kontrolü * güç) + dış etkenler
-        acceleration = (action[0] * 0.8) + total_disturbance
+        acceleration = (action[0] * 0.8) + total_disturbance #Uçağın fiziğidir. Ajanın hamlesi (action) ile dış etkenlerin toplamı uçağın ivmesini belirler.
         self.theta_dot += acceleration * dt
         self.theta += self.theta_dot * dt
         
         # ÖDÜL FONKSİYONU (Senin düzenlediğin yumuşak manevra yapısı(Açı hatası, sarsıntı ve enerji tüketimi cezası))
         reward = -(25.0 * (self.theta**2) + 1.5 * (self.theta_dot**2) + 0.05 * (action[0]**2)) # burada 30 açı çarpanını 25 ile 2 olan açısal hız çarpanını 1.5 ile  1 olan action manevra çarpanını 0.05 ile değiştik.amaç ajanın daha yumuşak manevra yapmasını sağlamak açı ve açısal hız çarpanını azaltarak.
-        
+        # Ödülde Açı hatası cezası. Uçağın burnu 0'dan ne kadar uzaksa o kadar ceza alır.
+        # Ödülde Açısal hız cezası. Uçağın çok hızlı sallanmasını (titremesini) engeller.
+        # Ödülde Kontrol cezası. Ajanın kanatçıkları sürekli aşırı hareket ettirmesini engeller, "yakıt tasarrufu" ve "yumuşak güzel bir sürüş" sağlar.
         self.steps += 1
         terminated = self.steps >= self.max_steps
         truncated = abs(self.theta) > 1.5 
@@ -67,7 +69,7 @@ if os.path.exists(log_dir):
 os.makedirs(log_dir)
 
 print("--- ADIM 1: Model Eğitiliyor (PPO) ---")
-print("Hedef: 100.000 adım. Lütfen bekleyin...")
+print("Hedef: 200.000 adım. Lütfen bekleyin...")
 
 env = AircraftCruiseEnv()
 env = Monitor(env, log_dir)
@@ -75,6 +77,9 @@ env = Monitor(env, log_dir)
 model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003, n_steps=4096) # burada learning rate değerini 0.007 den 0.0003 e steps değerini 1024 den 2048 çıkardık.Amaç Öğrenme oranını bir miktar düşürmek ve adım sayısını artırmak, modelin daha küçük adımlarla daha detaylı öğrenmesini sağlamak 
 model.learn(total_timesteps=200000) # Daha iyi sonuç için 100k den 200000 çıkardık ajanın daha iyi pratik yapması için bu daha kararlı sonuçlar elde etmemize yardımcı olur.
 print("Eğitim tamamlandı.")
+# Learning Rate:Ajanın hatalarından ne kadar hızlı ders çıkaracağıdır.Artarsa: Hızlı öğrenir ama dengesizleşebilir (ezberleyebilir).Azalırsa: Daha sağlam öğrenir ama eğitim çok uzun sürer.
+# Steps:Ajanın toplam kaç kez deneme yanılma yapacağıdır. 100-200 bin adım, uçağın rüzgarın her türlü varyasyonunu öğrenmesi için ideal bir süredir.
+
 
 # ---------------------------------------------------------
 # 3. TEST VE ANALİZ GRAFİKLERİ
